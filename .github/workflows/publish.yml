@@ -40,10 +40,18 @@ jobs:
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
         run: python main.py
 
-      - name: Commit state (only if changed)
+      - name: Commit state (retry on network jitter)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main || true
           git add posted.json
-          git diff --staged --quiet || (git commit -m "chore: update posted state" && git push)
+          git diff --staged --quiet && echo "no state change, skip" && exit 0
+          for i in 1 2 3; do
+            git pull --rebase origin main || true
+            if git commit -m "chore: update posted state" && git push; then
+              echo "state committed & pushed (attempt $i)"
+              break
+            fi
+            echo "[WARN] push failed attempt $i, retry after 5s"
+            sleep 5
+          done

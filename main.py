@@ -99,14 +99,26 @@ def cleanup_state(state, now):
 
 # ---------------- 采集（合规：仅官方 JSON） ----------------
 def fetch_push():
-    try:
-        r = requests.get(PUSH_URL, timeout=FETCH_TIMEOUT, headers=UA)
-        r.raise_for_status()
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"[WARN] fetch push.json failed: {e}")
-        return []
+    """拉取线报酷官方 push.json。
+    抗断流/抖动：最多 3 次指数退避重试。返回 (items, ok)：
+      ok=True  表示本次确实成功拿到数据（即便列表为空也是源站正常返回）；
+      ok=False 表示连续 3 次都失败（源站/网络中断），调用方据此告警。
+    """
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(PUSH_URL, timeout=FETCH_TIMEOUT, headers=UA)
+            r.raise_for_status()
+            data = r.json()
+            items = data if isinstance(data, list) else []
+            return items, True
+        except Exception as e:
+            last_err = str(e)
+            print(f"[WARN] fetch push.json attempt {attempt + 1}/3 failed: {e}")
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))     # 3s, 6s 退避
+    print(f"[ERROR] fetch push.json failed after 3 attempts: {last_err}")
+    return [], False
 
 
 # ---------------- 京东链接校验（follow 跳转） ----------------
@@ -124,16 +136,22 @@ def extract_links(html):
 
 
 def resolve_jd(url):
-    """返回 (is_jd, final_url)。仅当最终落地 host 属于 jd 域才认作京东真链。"""
-    try:
-        r = requests.get(url, allow_redirects=True, timeout=JD_RESOLVE_TIMEOUT,
-                         headers=UA, stream=True)
-        final = r.url
-        r.close()
-        host = urlparse(final).hostname or ""
-        return is_jd_host(host), final
-    except Exception:
-        return False, url
+    """返回 (is_jd, final_url)。仅当最终落地 host 属于 jd 域才认作京东真链。
+    内部带 1 次重试，缓解京东短链瞬时网络抖动导致的误判。"""
+    last_err = None
+    for attempt in range(2):
+        try:
+            r = requests.get(url, allow_redirects=True, timeout=JD_RESOLVE_TIMEOUT,
+                             headers=UA, stream=True)
+            final = r.url
+            r.close()
+            host = urlparse(final).hostname or ""
+            return is_jd_host(host), final
+        except Exception as e:
+            last_err = str(e)
+            if attempt == 0:
+                time.sleep(1)
+    return False, url
 
 
 def find_jd_link(html):
@@ -201,6 +219,37 @@ def classify(item):
     return None, None
 
 
+# ---------------- WP 侧兜底去重（抗状态文件丢失/漂移） ----------------
+def wp_post_exists(title, cat_id):
+    """查询 WP 是否已存在同标题同分类的已发布文章。
+    作为状态文件 posted.json 的兜底：即便状态因网络抖动丢失/未提交，
+    也能避免把已发文章重复发布到站点。查询失败一律返回 False（宁可发、不误杀）。"""
+    if not (WP_SITE and WP_USER and WP_APP_PASSWORD):
+        return False
+    auth = base64.b64encode(f"{WP_USER}:{WP_APP_PASSWORD}".encode("utf-8")).decode()
+    headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
+    params = {
+        "search": title[:50],
+        "categories": cat_id,
+        "per_page": 5,
+        "status": "publish",
+    }
+    try:
+        r = requests.get(f"{WP_SITE}/wp-json/wp/v2/posts", params=params,
+                         headers=headers, timeout=WP_TIMEOUT)
+        if r.status_code != 200:
+            return False
+        posts = r.json()
+        norm = title.strip()
+        return any(
+            (p.get("title", {}).get("rendered", "") or "").strip() == norm
+            for p in posts
+        )
+    except Exception as e:
+        print(f"[WARN] wp_post_exists check failed (proceed to publish): {e}")
+        return False
+
+
 # ---------------- 发布到 WP ----------------
 def publish_to_wp(title, content_html, cat_id):
     if not (WP_SITE and WP_USER and WP_APP_PASSWORD):
@@ -242,39 +291,53 @@ def main():
     state = load_state()
     state = cleanup_state(state, now)
 
-    items = fetch_push()
-    print(f"[INFO] fetched {len(items)} items")
+    items, fetch_ok = fetch_push()
+    print(f"[INFO] fetched {len(items)} items (source_ok={fetch_ok})")
 
     new_count = 0
+    skip_dup = 0
     for item in items:
-        iid = str(item.get("id"))
-        if iid in state:                       # 去重
+        try:
+            iid = str(item.get("id"))
+            if iid in state:                       # 去重（状态文件）
+                continue
+            cat_id, jd_link = classify(item)
+            if cat_id is None:                     # 非京东非银行 -> 丢弃
+                continue
+            content_html = item.get("content_html", "") or ""
+            clean = strip_media(content_html)
+            if not clean.strip():                  # content_html 为空时降级用纯文本
+                raw_text = (item.get("content", "") or "").strip()
+                if raw_text:
+                    clean = "<p>" + escape(raw_text) + "</p>"
+            if not clean.strip():                  # 纯图片且无文本 -> 跳过
+                continue
+            # 回链合规，固化进模板
+            src_url = IXBK_BASE + (item.get("url") or "")
+            source_html = (
+                f'<p>来源：线报酷 ｜ '
+                f'<a href="{src_url}" target="_blank" rel="nofollow">查看原文</a></p>'
+            )
+            content = clean + source_html
+            title = item.get("title", "")
+            # WP 侧兜底去重：状态丢失时也不重复发
+            if wp_post_exists(title, cat_id):
+                print(f"[SKIP] already exists on WP (state lost?) title={title[:30]}")
+                state[iid] = now
+                skip_dup += 1
+                continue
+            pid = publish_to_wp(title, content, cat_id)
+            if pid:                                # 仅成功才标记，避免重复发
+                state[iid] = now
+                new_count += 1
+        except Exception as e:
+            print(f"[WARN] item processing error, skipped: {e}")
             continue
-        cat_id, jd_link = classify(item)
-        if cat_id is None:                     # 非京东非银行 -> 丢弃
-            continue
-        content_html = item.get("content_html", "") or ""
-        clean = strip_media(content_html)
-        if not clean.strip():                  # content_html 为空时降级用纯文本
-            raw_text = (item.get("content", "") or "").strip()
-            if raw_text:
-                clean = "<p>" + escape(raw_text) + "</p>"
-        if not clean.strip():                  # 纯图片且无文本 -> 跳过
-            continue
-        # 审查修6：回链合规，固化进模板
-        src_url = IXBK_BASE + (item.get("url") or "")
-        source_html = (
-            f'<p>来源：线报酷 ｜ '
-            f'<a href="{src_url}" target="_blank" rel="nofollow">查看原文</a></p>'
-        )
-        content = clean + source_html
-        pid = publish_to_wp(item.get("title", ""), content, cat_id)
-        if pid:                                # 仅成功才标记，避免重复发
-            state[iid] = now
-            new_count += 1
 
     save_state(state)
-    print(f"[DONE] new published={new_count}, tracked={len(state)}")
+    status = "OK" if fetch_ok else "WARN_SOURCE_DOWN"
+    print(f"[{status}] new published={new_count}, skip_dup={skip_dup}, "
+          f"tracked={len(state)}")
     return 0
 
 
