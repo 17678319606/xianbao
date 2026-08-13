@@ -28,7 +28,7 @@ from bs4 import BeautifulSoup
 IXBK_BASE = "https://news.ixbk.net"
 PUSH_URL = IXBK_BASE + "/plus/json/push.json"
 
-WP_SITE = os.environ.get("WP_SITE", "").rstrip("/")
+WP_SITE = os.environ.get("WP_SITE", "").strip().rstrip("/")
 WP_USER = os.environ.get("WP_USER", "")
 WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
 
