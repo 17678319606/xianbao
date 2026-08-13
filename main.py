@@ -19,6 +19,7 @@ import json
 import re
 import time
 import base64
+from html import escape
 from urllib.parse import urlparse
 
 import requests
@@ -110,9 +111,15 @@ def fetch_push():
 
 # ---------------- 京东链接校验（follow 跳转） ----------------
 def extract_links(html):
+    """仅从超链接(a href)与可见文本提取 URL，先 decompose 掉 <img>/<video> 等
+    媒体与脚本标签，避免把京东配图域名(img.jd.com)误判为京东商品链接。"""
     soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup(["img", "video", "iframe", "script", "style",
+                     "source", "embed", "object", "noscript", "figure"]):
+        tag.decompose()
     links = [a.get("href") for a in soup.find_all("a", href=True)]
-    links += re.findall(r"https?://[^\s<>\"]+", html or "")
+    text = soup.get_text()
+    links += re.findall(r"https?://[^\s<>\"]+", text)
     return [u for u in links if u and u.startswith("http")]
 
 
@@ -132,7 +139,10 @@ def resolve_jd(url):
 def find_jd_link(html):
     """从正文提取并校验京东真实链接。
     优先选取明确的商品/短链域(u.jd.com / item.jd.com / item.m.jd.com / 3.cn)，
-    其次其他 *.jd.com 子域；每个候选都 follow 跳转确认最终落地 jd 域。
+    其次其他 *.jd.com 子域。
+    对"明确的京东官方短链/商品域"：即便 follow 跳转因网络抖动失败也信任其域名
+    （域名本身就是京东的，不可能伪装成非京东），避免误丢好价；
+    对"其他 *.jd.com 子域"：必须 follow 跳转确认最终落地 jd 域（防伪装）。
     返回 (原始链接, 最终落地链接) 或 (None, None)。
     """
     links = extract_links(html)
@@ -143,7 +153,13 @@ def find_jd_link(html):
             preferred.append(u)
         elif is_jd_host(host):
             others.append(u)
-    for u in preferred + others:          # 先商品/短链，后其他 jd 子域
+    for u in preferred:                   # 明确的京东短链/商品域优先
+        ok, final = resolve_jd(u)
+        if ok:
+            return u, final
+    if preferred:                         # 全部解析失败（网络抖动）：信任域名
+        return preferred[0], preferred[0]
+    for u in others:                      # 其他 jd 子域：必须解析确认
         ok, final = resolve_jd(u)
         if ok:
             return u, final
@@ -170,12 +186,14 @@ def is_bank(text):
 def classify(item):
     """返回 (category_id, jd_link) 或 (None, None) 表示丢弃。"""
     html = item.get("content_html", "") or ""
-    jd_orig, jd_final = find_jd_link(html)
+    text_content = item.get("content", "") or ""
+    # 京东链接可从 content_html 与 content 纯文本两处提取（兼容无 HTML 的情况）
+    jd_orig, jd_final = find_jd_link(html + " " + text_content)
     if jd_orig:
         return 1, (jd_final or jd_orig)        # 类目1：京东好价线报（优先）
     text = " ".join([
         item.get("title", ""),
-        item.get("content", ""),
+        text_content,
         item.get("catename", ""),
     ])
     if is_bank(text):
@@ -235,8 +253,13 @@ def main():
         cat_id, jd_link = classify(item)
         if cat_id is None:                     # 非京东非银行 -> 丢弃
             continue
-        clean = strip_media(item.get("content_html", ""))
-        if not clean:                          # 纯图片无文本 -> 跳过
+        content_html = item.get("content_html", "") or ""
+        clean = strip_media(content_html)
+        if not clean.strip():                  # content_html 为空时降级用纯文本
+            raw_text = (item.get("content", "") or "").strip()
+            if raw_text:
+                clean = "<p>" + escape(raw_text) + "</p>"
+        if not clean.strip():                  # 纯图片且无文本 -> 跳过
             continue
         # 审查修6：回链合规，固化进模板
         src_url = IXBK_BASE + (item.get("url") or "")
