@@ -67,8 +67,11 @@ def load_dotenv(path=".env"):
 # 服务器部署：优先从同目录 .env 注入密钥（GitHub Actions 下无 .env，走 Secrets 环境变量）
 load_dotenv()
 
-# 失败告警（企业微信机器人 + 邮件），定义在 alert.py，随 .env 读取凭据
-from alert import send_alert
+# 失败告警（可选，alert.py 缺失时优雅跳过）
+try:
+    from alert import send_alert
+except ImportError:
+    def send_alert(title, content, key=None): return False
 
 # ---------------- 配置 ----------------
 IXBK_BASE = "https://news.ixbk.net"
