@@ -9,6 +9,7 @@ _diag_venv/
 .env.production
 !.env.example
 last_run.json
+posted.json
 .alert_state.json
 xianbao-server.zip
 .runlock

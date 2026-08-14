@@ -353,26 +353,18 @@ def classify(item):
 # ---------------- WP 侧兜底去重（抗状态文件丢失/漂移/混合触发双发） ----------------
 
 def wp_post_exists(iid, title, cat_id):
-    """WP 侧兜底去重，作为 posted.json 的二次保险：
-      1) 优先按自定义 meta(xianbao_item_id) 精确查重 —— 跨服务器/GitHub 双触发也不会重复；
-      2) 退回「同标题+同分类」匹配 —— 覆盖升级前已发布的旧文章（无该 meta）。
-      任一命中即认为已发，跳过。查询失败一律返回 False（宁可发、不误杀）。"""
+    """WP 侧兜底去重，作为 posted.json 的二次保险。
+
+    重要：本站的 WP REST API 对 posts 集合的 meta_key/meta_value 过滤**不生效**
+    （传入不存在的 meta_value 仍返回最新文章），若用它判断会误判“已存在”而把
+    所有条目全部跳过、导致永远发不出去。因此这里**只做「同标题 + 同分类」精确匹配**
+    （覆盖升级前已发布的旧文章 / 状态文件丢失场景），绝不用 meta 查询。
+    查询失败一律返回 False（宁可发、不误杀）。"""
     if not (WP_SITE and WP_USER and WP_APP_PASSWORD):
         return False
     auth = base64.b64encode(f"{WP_USER}:{WP_APP_PASSWORD}".encode("utf-8")).decode()
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
-    # 1) 精确 meta 查重（最可靠）
-    try:
-        r = requests.get(f"{WP_SITE}/wp-json/wp/v2/posts",
-                         params={"meta_key": "xianbao_item_id",
-                                 "meta_value": iid,
-                                 "per_page": 1, "status": "publish"},
-                         headers=headers, timeout=WP_TIMEOUT)
-        if r.status_code == 200 and r.json():
-            return True
-    except Exception as e:
-        print(f"[WARN] wp meta dedup check failed: {e}")
-    # 2) 退回：同标题+同分类
+    # 同标题 + 同分类 精确匹配（WP 的 search/categories 过滤可靠，不会误返全量）
     try:
         r = requests.get(f"{WP_SITE}/wp-json/wp/v2/posts",
                          params={"search": title[:50], "categories": cat_id,
@@ -400,7 +392,6 @@ def publish_to_wp(title, content_html, cat_id, iid):
         "content": content_html,
         "categories": [cat_id],
         "status": PUBLISH_STATUS,
-        "meta": {"xianbao_item_id": iid},   # 写入溯源 id，供 WP 侧精确去重
     }
     auth = base64.b64encode(
         f"{WP_USER}:{WP_APP_PASSWORD}".encode("utf-8")
