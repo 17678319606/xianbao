@@ -1,21 +1,19 @@
 name: xianbao-push
 
+# 说明：自 2026-08 起，运行时已迁移到用户自有 1H1G 国内服务器（宝塔计划任务 / systemd），
+# 每 5 分钟精确执行，不再依赖 GitHub Actions 定时（其 cron 为尽力而为，高峰期会延迟/
+# 跳过，且仓库 60 天无人工活动会自动禁用定时，导致"很久收不到更新"）。
+# 故此处【默认关闭 schedule】，仅保留手动触发（workflow_dispatch）作为应急探针/回退。
+# 如需把 GitHub 当备用源：把下方 schedule 注释取消即可，但注意可能与服务器双发
+# （WP 侧同标题+同分类兜底去重可缓解，但不建议常态双跑）。
+
 on:
-  schedule:
-    # 最短合规间隔 = 每 5 分钟（GitHub cron 最小粒度即 5 分钟）。
-    # 源站线报酷限制"持续轮询≥5秒"，而本工作流每次运行只 GET 一次 push.json，
-    # 每 5 分钟才请求一次，远低于下限，不会封 IP —— 合规且最快。
-    # 注意：必须保持仓库为【公开】，公开库 Linux 分钟无限；
-    # 若设为私有库，每 5 分钟会超 2000 分/月免费额度，私有库请改用 "0 * * * *"（每小时）。
-    - cron: "*/5 * * * *"
+  # schedule:
+  #   - cron: "*/5 * * * *"
   workflow_dispatch: {}   # 允许在 Actions 页面手动点「Run workflow」测试/探针
 
 permissions:
-  contents: write         # 允许提交 posted.json 去重状态文件（用内置 GITHUB_TOKEN，无需额外配置）
-
-concurrency:
-  group: xianbao-push
-  cancel-in-progress: false   # 串行执行，防止并发覆盖状态文件（审查修2）
+  contents: write         # 仅手动跑时才提交状态；服务器版不依赖此提交
 
 jobs:
   push:
@@ -41,6 +39,7 @@ jobs:
         run: python main.py
 
       - name: Commit state (retry on network jitter)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-线报酷 -> WordPress 自动采集发布（GitHub Actions 版）
+线报酷 -> WordPress 自动采集发布（运行时无关版）
+
+适用运行时：
+  - 你的 1H1G 国内服务器（宝塔"计划任务" / crontab / systemd 每 5 分钟跑一次）
+  - 也可继续在 GitHub Actions 手动触发（schedule 已默认关闭，避免双发）
 
 合规：仅调用线报酷官方 JSON 接口（push.json），发布时强制回链源站。
-安全：所有密钥来自环境变量（GitHub Secrets），绝不落库。
+安全：密钥来自环境变量（GitHub Secrets 或服务器本地 .env），绝不落库。
 落地约束：
   - 直接发布(PUBLISH_STATUS="publish")，不经草稿
-  - 银行活动识别最大化(超全关键词+主要银行简称)，不漏任何银行相关活动
-  - 京东短链(u.jd.com/3.cn/item.jd.com)必须 follow 跳转确认落地 jd 域，
-    且优先选取商品/短链域，确保"带京东链接"真实有效
-  - 分类优先级：真实京东链接 -> 类目1；银行关键词 -> 类目10；其余丢弃
+  - 类目10「优惠活动」覆盖：银行活动 + 通信运营商活动(移动/电信/联通/广电) + 移动支付平台活动(微信/支付宝/云闪付/抖音等满减立减)
+  - 京东短链(u.jd.com/3.cn/item.jd.com)必须 follow 跳转确认落地 jd 域
+  - 分类优先级：真实京东链接 -> 类目1；银行/运营商/支付平台关键词 -> 类目10；其余丢弃
   - 仅发布成功才写入去重状态，异常绝不标记已发
+  - 失败告警：企业微信机器人 + 邮件（alert.py），含 6 小时冷却
+
+服务器版新增：
+  - 自动读取同目录 .env（服务器部署用，不污染环境）
+  - 落盘心跳文件 last_run.json（方便监控"是否还活着"）
+  - 支持 --loop（常驻循环，配 systemd）/ --once（默认，配计划任务）/ --dry-run（只验不发）
 """
 import os
 import sys
@@ -19,11 +28,39 @@ import json
 import re
 import time
 import base64
+import hashlib
+import argparse
 from html import escape
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+
+def load_dotenv(path=".env"):
+    """极简 .env 解析（不引入 python-dotenv 依赖）。仅填充尚未存在的变量。
+    必须在读取 WP_SITE/WP_USER/WP_APP_PASSWORD 之前执行（见下方调用）。"""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception as e:
+        print(f"[WARN] load .env failed: {e}")
+
+
+# 服务器部署：优先从同目录 .env 注入密钥（GitHub Actions 下无 .env，走 Secrets 环境变量）
+load_dotenv()
+
+# 失败告警（企业微信机器人 + 邮件），定义在 alert.py，随 .env 读取凭据
+from alert import send_alert
 
 # ---------------- 配置 ----------------
 IXBK_BASE = "https://news.ixbk.net"
@@ -34,16 +71,19 @@ WP_USER = os.environ.get("WP_USER", "")
 WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
 
 STATE_FILE = "posted.json"
+HEARTBEAT_FILE = "last_run.json"
 MAX_AGE_DAYS = 30
 PUBLISH_STATUS = "publish"    # 用户要求：直接发布，不经草稿
 FETCH_TIMEOUT = 15
 WP_TIMEOUT = 20
 JD_RESOLVE_TIMEOUT = 10
+LOOP_INTERVAL = int(os.environ.get("XIANBAO_INTERVAL", "300"))  # 默认 5 分钟一轮
 
 UA = {
-    "User-Agent": "Mozilla/5.0 (compatible; XianbaoBot/1.0; "
+    "User-Agent": "Mozilla/5.0 (compatible; XianbaoBot/1.1; "
     "+https://github.com/17678319606/xianbao)"
 }
+
 
 # 京东相关域名白名单（含短链 u.jd.com / 3.cn）
 def is_jd_host(host):
@@ -51,6 +91,7 @@ def is_jd_host(host):
         return False
     host = host.lower()
     return host == "jd.com" or host.endswith(".jd.com") or host.endswith("3.cn")
+
 
 # 银行活动关键词（命中即归「活动信息」类目 id=10）。
 # 设计原则：宁可稍宽不可漏 —— 用户要求"不要错漏任何银行相关活动信息"。
@@ -75,6 +116,32 @@ BANK_KEYWORDS = [
     "网商银行", "网商", "微众银行", "微众", "新网银行", "百信银行", "众邦银行",
 ]
 
+# 通信运营商活动关键词（命中即归「优惠活动」类目 id=10）。
+# 覆盖：中国移动 / 中国电信 / 中国联通 / 中国广电 的话费、流量、套餐、宽带、权益类活动。
+# 注意：避免裸词"移动"（易误命中"移动电源/移动硬盘"），统一用"中国移动/移动话费/移动流量"等组合。
+TELECOM_KEYWORDS = [
+    "中国移动", "中国电信", "中国联通", "中国广电",
+    "移动话费", "移动流量", "移动权益", "移动宽带", "移动套餐", "移动号卡",
+    "电信", "联通", "广电",
+    "话费充值", "充话费", "充值话费", "流量充值", "运营商",
+    "宽带套餐", "合约机", "办宽带", "5G套餐", "携号转网",
+]
+
+# 移动支付平台活动关键词（命中即归「优惠活动」类目 id=10）。
+# 覆盖：微信支付 / 支付宝 / 云闪付(银联) / 抖音支付 / 美团支付 / 京东支付 / 翼支付 / 数字人民币
+# 以及其"满减、立减、红包、立减金、消费券"等典型支付优惠活动。
+# 设计：平台名 + 活动信号词组合，避免裸词"微信/红包"等过宽误判。
+PAYMENT_KEYWORDS = [
+    "支付宝", "支付宝红包", "支付宝立减", "支付宝优惠",
+    "微信支付", "微信红包", "微信立减", "微信支付优惠", "微信支付有优惠",
+    "云闪付", "银联云闪付", "银联", "银联红包", "银联优惠",
+    "翼支付", "抖音支付", "抖音红包", "抖音支付优惠",
+    "美团支付", "美团红包", "美团支付优惠", "京东支付", "京东支付优惠",
+    "度小满", "数字人民币", "数币", "数字人民币红包",
+    "立减金", "支付立减", "支付满减", "满减金", "支付红包", "付款红包",
+    "消费券", "支付优惠", "扫码立减", "扫码红包",
+]
+
 
 # ---------------- 状态（去重 + 30天清理） ----------------
 def load_state():
@@ -88,13 +155,25 @@ def load_state():
 
 
 def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)   # 原子写入，避免半截文件
 
 
 def cleanup_state(state, now):
     cutoff = now - MAX_AGE_DAYS * 86400
     return {k: v for k, v in state.items() if v and int(v) > cutoff}
+
+
+def write_heartbeat(result):
+    """落盘心跳：监控脚本/你都能一眼看出"上次成功跑是什么时候"。"""
+    try:
+        payload = {"ts": int(time.time()), **result}
+        with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] write heartbeat failed: {e}")
 
 
 # ---------------- 采集（合规：仅官方 JSON） ----------------
@@ -201,8 +280,21 @@ def is_bank(text):
     return any(kw in text for kw in BANK_KEYWORDS)
 
 
+def is_telecom(text):
+    return any(kw in text for kw in TELECOM_KEYWORDS)
+
+
+def is_payment(text):
+    return any(kw in text for kw in PAYMENT_KEYWORDS)
+
+
 def classify(item):
-    """返回 (category_id, jd_link) 或 (None, None) 表示丢弃。"""
+    """返回 (category_id, jd_link) 或 (None, None) 表示丢弃。
+    分类优先级：
+      真实京东链接         -> 类目1（京东好价线报，优先）
+      银行/运营商/支付平台  -> 类目10（优惠活动：银行活动 + 通信运营商活动 + 移动支付平台活动）
+      其余                  -> 丢弃
+    """
     html = item.get("content_html", "") or ""
     text_content = item.get("content", "") or ""
     # 京东链接可从 content_html 与 content 纯文本两处提取（兼容无 HTML 的情况）
@@ -214,44 +306,52 @@ def classify(item):
         text_content,
         item.get("catename", ""),
     ])
-    if is_bank(text):
-        return 10, None                         # 类目10：活动信息
+    if is_bank(text) or is_telecom(text) or is_payment(text):
+        return 10, None                         # 类目10：优惠活动（银行+运营商+支付平台）
     return None, None
 
 
-# ---------------- WP 侧兜底去重（抗状态文件丢失/漂移） ----------------
-def wp_post_exists(title, cat_id):
-    """查询 WP 是否已存在同标题同分类的已发布文章。
-    作为状态文件 posted.json 的兜底：即便状态因网络抖动丢失/未提交，
-    也能避免把已发文章重复发布到站点。查询失败一律返回 False（宁可发、不误杀）。"""
+# ---------------- WP 侧兜底去重（抗状态文件丢失/漂移/混合触发双发） ----------------
+def wp_post_exists(iid, title, cat_id):
+    """WP 侧兜底去重，作为 posted.json 的二次保险：
+      1) 优先按自定义 meta(xianbao_item_id) 精确查重 —— 跨服务器/GitHub 双触发也不会重复；
+      2) 退回「同标题+同分类」匹配 —— 覆盖升级前已发布的旧文章（无该 meta）。
+      任一命中即认为已发，跳过。查询失败一律返回 False（宁可发、不误杀）。"""
     if not (WP_SITE and WP_USER and WP_APP_PASSWORD):
         return False
     auth = base64.b64encode(f"{WP_USER}:{WP_APP_PASSWORD}".encode("utf-8")).decode()
     headers = {"Authorization": f"Basic {auth}", "Accept": "application/json"}
-    params = {
-        "search": title[:50],
-        "categories": cat_id,
-        "per_page": 5,
-        "status": "publish",
-    }
+    # 1) 精确 meta 查重（最可靠）
     try:
-        r = requests.get(f"{WP_SITE}/wp-json/wp/v2/posts", params=params,
+        r = requests.get(f"{WP_SITE}/wp-json/wp/v2/posts",
+                         params={"meta_key": "xianbao_item_id",
+                                 "meta_value": iid,
+                                 "per_page": 1, "status": "publish"},
+                         headers=headers, timeout=WP_TIMEOUT)
+        if r.status_code == 200 and r.json():
+            return True
+    except Exception as e:
+        print(f"[WARN] wp meta dedup check failed: {e}")
+    # 2) 退回：同标题+同分类
+    try:
+        r = requests.get(f"{WP_SITE}/wp-json/wp/v2/posts",
+                         params={"search": title[:50], "categories": cat_id,
+                                 "per_page": 5, "status": "publish"},
                          headers=headers, timeout=WP_TIMEOUT)
         if r.status_code != 200:
             return False
-        posts = r.json()
         norm = title.strip()
         return any(
             (p.get("title", {}).get("rendered", "") or "").strip() == norm
-            for p in posts
+            for p in r.json()
         )
     except Exception as e:
-        print(f"[WARN] wp_post_exists check failed (proceed to publish): {e}")
+        print(f"[WARN] wp title dedup check failed (proceed to publish): {e}")
         return False
 
 
 # ---------------- 发布到 WP ----------------
-def publish_to_wp(title, content_html, cat_id):
+def publish_to_wp(title, content_html, cat_id, iid):
     if not (WP_SITE and WP_USER and WP_APP_PASSWORD):
         print("[ERROR] WP credentials missing, skip publish")
         return None
@@ -260,6 +360,7 @@ def publish_to_wp(title, content_html, cat_id):
         "content": content_html,
         "categories": [cat_id],
         "status": PUBLISH_STATUS,
+        "meta": {"xianbao_item_id": iid},   # 写入溯源 id，供 WP 侧精确去重
     }
     auth = base64.b64encode(
         f"{WP_USER}:{WP_APP_PASSWORD}".encode("utf-8")
@@ -286,7 +387,7 @@ def publish_to_wp(title, content_html, cat_id):
 
 
 # ---------------- 主流程 ----------------
-def main():
+def run_once(dry_run=False):
     now = int(time.time())
     state = load_state()
     state = cleanup_state(state, now)
@@ -296,13 +397,18 @@ def main():
 
     new_count = 0
     skip_dup = 0
+    publish_failed = 0
     for item in items:
         try:
-            iid = str(item.get("id"))
+            title = (item.get("title", "") or "").strip()
+            # 稳定的去重键：优先用源站 id；缺失时退回标题哈希，避免不同文章共享 "None"
+            iid_raw = item.get("id")
+            iid = ("h" + hashlib.md5(title.encode("utf-8")).hexdigest()[:16]) \
+                if iid_raw is None else str(iid_raw)
             if iid in state:                       # 去重（状态文件）
                 continue
             cat_id, jd_link = classify(item)
-            if cat_id is None:                     # 非京东非银行 -> 丢弃
+            if cat_id is None:                     # 非京东/非活动 -> 丢弃
                 continue
             content_html = item.get("content_html", "") or ""
             clean = strip_media(content_html)
@@ -319,26 +425,81 @@ def main():
                 f'<a href="{src_url}" target="_blank" rel="nofollow">查看原文</a></p>'
             )
             content = clean + source_html
-            title = item.get("title", "")
-            # WP 侧兜底去重：状态丢失时也不重复发
-            if wp_post_exists(title, cat_id):
+            # WP 侧兜底去重：状态丢失/混合触发时也不重复发
+            if wp_post_exists(iid, title, cat_id):
                 print(f"[SKIP] already exists on WP (state lost?) title={title[:30]}")
                 state[iid] = now
                 skip_dup += 1
                 continue
-            pid = publish_to_wp(title, content, cat_id)
+            if dry_run:
+                print(f"[DRY] would publish cat={cat_id} title={title[:30]}")
+                continue                            # dry-run 不真正发、不改状态
+            pid = publish_to_wp(title, content, cat_id, iid)
             if pid:                                # 仅成功才标记，避免重复发
                 state[iid] = now
                 new_count += 1
+            else:
+                publish_failed += 1
         except Exception as e:
             print(f"[WARN] item processing error, skipped: {e}")
             continue
 
-    save_state(state)
+    # 失败告警（含 6 小时冷却，避免每 5 分钟刷屏）
+    if not fetch_ok:
+        send_alert(
+            "线报采集源故障",
+            f"push.json 连续 3 次拉取失败（{time.strftime('%Y-%m-%d %H:%M')}）。"
+            f"可能是线报酷源站抖动或服务器出网异常，请关注。",
+            key="source_down",
+        )
+    if publish_failed > 0:
+        send_alert(
+            "WP 文章发布失败",
+            f"本轮有 {publish_failed} 篇未能发布成功（可能 WP 应用密码失效或接口异常），"
+            f"请检查 WP 凭据与站点状态。",
+            key="publish_fail",
+        )
+
+    if not dry_run:
+        save_state(state)
     status = "OK" if fetch_ok else "WARN_SOURCE_DOWN"
     print(f"[{status}] new published={new_count}, skip_dup={skip_dup}, "
           f"tracked={len(state)}")
-    return 0
+    return {
+        "status": status,
+        "new": new_count,
+        "skip": skip_dup,
+        "source_ok": fetch_ok,
+        "tracked": len(state),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="线报酷 -> WP 自动采集发布")
+    parser.add_argument("--loop", action="store_true",
+                        help="常驻循环模式（配合 systemd，每 XIANBAO_INTERVAL 秒一轮）")
+    parser.add_argument("--once", action="store_true", help="单次运行后退出（默认，配合计划任务/cron）")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="只校验采集/分类/连通性，不真正发布、不改状态")
+    args = parser.parse_args()
+
+    if args.loop:
+        print(f"[INFO] loop mode, interval={LOOP_INTERVAL}s")
+        while True:
+            try:
+                result = run_once(dry_run=args.dry_run)
+            except Exception as e:
+                result = {"status": "ERROR", "new": 0, "skip": 0,
+                          "source_ok": False, "tracked": 0}
+                print(f"[ERROR] iteration crashed: {e}")
+                send_alert("采集进程异常崩溃",
+                           f"--loop 常驻模式发生未捕获异常：{e}", key="crash")
+            write_heartbeat(result)
+            time.sleep(LOOP_INTERVAL)
+    else:
+        result = run_once(dry_run=args.dry_run)
+        write_heartbeat(result)
+        return 0
 
 
 if __name__ == "__main__":

@@ -1,0 +1,20 @@
+[Unit]
+Description=线报酷 -> WordPress 自动采集发布 (xianbao)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 改成你实际部署目录；运行用户请用能读写该目录的账号（如 root 或 www）
+WorkingDirectory=/opt/xianbao
+ExecStart=/opt/xianbao/.venv/bin/python main.py --loop
+EnvironmentFile=/opt/xianbao/.env
+# 1H1G 资源保护：封顶内存，超了会被 systemd 杀掉并按 Restart 拉起，不会拖垮整机
+MemoryHigh=96M
+MemoryMax=160M
+# 关键：异常退出 10 秒后自动拉起；配合 WantedBy 开机自启 => 不会被销毁/停摆
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
