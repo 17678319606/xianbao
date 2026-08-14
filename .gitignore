@@ -5,7 +5,9 @@ venv/
 _diag_venv/
 *.log
 .env
-.env.*
+.env.local
+.env.production
+!.env.example
 last_run.json
 .alert_state.json
 xianbao-server.zip
