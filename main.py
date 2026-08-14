@@ -260,34 +260,48 @@ def resolve_jd(url):
     return False, url
 
 
-def find_jd_link(html):
-    """从正文提取并校验京东真实链接。
-    优先选取明确的商品/短链域(u.jd.com / item.jd.com / item.m.jd.com / 3.cn)，
-    其次其他 *.jd.com 子域。
-    对"明确的京东官方短链/商品域"：即便 follow 跳转因网络抖动失败也信任其域名
-    （域名本身就是京东的，不可能伪装成非京东），避免误丢好价；
-    对"其他 *.jd.com 子域"：必须 follow 跳转确认最终落地 jd 域（防伪装）。
-    返回 (原始链接, 最终落地链接) 或 (None, None)。
-    """
-    links = extract_links(html)
-    preferred, others = [], []
-    for u in links:
-        host = (urlparse(u).hostname or "").lower()
-        if host in ("u.jd.com", "item.jd.com", "item.m.jd.com") or host.endswith("3.cn"):
-            preferred.append(u)
-        elif is_jd_host(host):
-            others.append(u)
-    for u in preferred:                   # 明确的京东短链/商品域优先
-        ok, final = resolve_jd(u)
-        if ok:
-            return u, final
-    if preferred:                         # 全部解析失败（网络抖动）：信任域名
-        return preferred[0], preferred[0]
-    for u in others:                      # 其他 jd 子域：必须解析确认
-        ok, final = resolve_jd(u)
-        if ok:
-            return u, final
+def _is_external_deal_link(u):
+    """判断 URL 是否为「站外好价外链」：http(s) 开头且不属于源站自身(ixbk)域名。"""
+    if not u or not u.startswith("http"):
+        return False
+    host = (urlparse(u).hostname or "").lower()
+    if not host:
+        return False
+    if host == "ixbk.net" or host.endswith(".ixbk.net"):
+        return False
+    return True
+
+
+def find_deal_link(html):
+    """从正文提取首个站外好价外链（京东/淘宝/天猫/拼多多/或其他电商店铺）。
+    用于判定该条是否属于「好价线报」(类目1)——只要带任意站外商品/店铺链接即收，
+    不再限定京东（修复：源站淘宝/天猫好价密集时整窗被误判为'无链接'而丢弃）。
+    返回 (原始链接, 原始链接) 或 (None, None)。仅排除源站自身站内链接。"""
+    if not html:
+        return None, None
+    for u in extract_links(html):
+        if _is_external_deal_link(u):
+            return u, u
     return None, None
+
+
+def fetch_detail_link(item):
+    """兜底：正文无站外链接时，抓取源站详情页(IXBK_BASE + item.url)提取首个站外链接。
+    应对部分条目正文未嵌入商品链接的情况（如纯文字播报）。
+    失败或无链接一律返回 None（宁可丢弃，绝不误发）。"""
+    url = item.get("url", "") or ""
+    if not url:
+        return None
+    full = url if url.startswith("http") else (IXBK_BASE + url)
+    try:
+        r = requests.get(full, timeout=FETCH_TIMEOUT, headers=UA)
+        r.raise_for_status()
+        for u in extract_links(r.text):
+            if _is_external_deal_link(u):
+                return u
+    except Exception as e:
+        print(f"[WARN] fetch detail page failed ({url}): {e}")
+    return None
 
 
 # ---------------- 过滤：剥离媒体 ----------------
@@ -322,17 +336,21 @@ def is_utility(text):
 def classify(item):
     """返回 (category_id, jd_link) 或 (None, None) 表示丢弃。
     分类优先级：
-      真实京东链接         -> 类目1（京东好价线报，优先）
+      任意站外好价链接(京东/淘宝/天猫/拼多多等) -> 类目1（好价线报，优先）
+        （正文无链接时自动探源站详情页补链）
       银行/运营商/支付平台/生活缴费 -> 类目10（优惠活动：银行活动 + 通信运营商活动
                                         + 移动支付平台活动 + 生活缴费优惠）
       其余                  -> 丢弃
     """
     html = item.get("content_html", "") or ""
     text_content = item.get("content", "") or ""
-    # 京东链接可从 content_html 与 content 纯文本两处提取（兼容无 HTML 的情况）
-    jd_orig, jd_final = find_jd_link(html + " " + text_content)
-    if jd_orig:
-        return 1, (jd_final or jd_orig)        # 类目1：京东好价线报（优先）
+    # 好价链接：content_html 与 content 纯文本两处都可提取（兼容无 HTML 的情况）
+    deal_orig, _ = find_deal_link(html + " " + text_content)
+    if not deal_orig:
+        # 兜底：正文没链接，探源站详情页补一个站外链接
+        deal_orig = fetch_detail_link(item)
+    if deal_orig:
+        return 1, deal_orig                     # 类目1：好价线报（任意平台）
     text = " ".join([
         item.get("title", ""),
         text_content,
@@ -439,7 +457,7 @@ def run_once(dry_run=False):
                 if iid_raw is None else str(iid_raw)
             if iid in state:                       # 去重（状态文件）
                 continue
-            cat_id, jd_link = classify(item)
+            cat_id, _ = classify(item)
             if cat_id is None:                     # 非京东/非活动 -> 丢弃
                 continue
             content_html = item.get("content_html", "") or ""
