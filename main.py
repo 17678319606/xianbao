@@ -11,9 +11,9 @@
 安全：密钥来自环境变量（GitHub Secrets 或服务器本地 .env），绝不落库。
 落地约束：
   - 直接发布(PUBLISH_STATUS="publish")，不经草稿
-  - 类目10「优惠活动」覆盖：银行活动 + 通信运营商活动(移动/电信/联通/广电) + 移动支付平台活动(微信/支付宝/云闪付/抖音等满减立减)
-  - 京东短链(u.jd.com/3.cn/item.jd.com)必须 follow 跳转确认落地 jd 域
-  - 分类优先级：真实京东链接 -> 类目1；银行/运营商/支付平台关键词 -> 类目10；其余丢弃
+  - 类目10「优惠活动」覆盖：银行活动 + 通信运营商活动(移动/电信/联通/广电) + 移动支付平台活动(微信/支付宝/云闪付/抖音等满减立减) + 生活缴费优惠
+  - 类目1「好价线报」严格只收京东链接(u.jd.com/jd.com/3.cn 等京东域)；淘宝/拼多多/其他电商/垃圾短链一律丢弃
+  - 分类优先级：京东链接 -> 类目1；无京东链接时银行/运营商/支付平台/生活缴费关键词命中 -> 类目10；其余丢弃
   - 仅发布成功才写入去重状态，异常绝不标记已发
   - 失败告警：企业微信机器人 + 邮件（alert.py），含 6 小时冷却
 
@@ -260,35 +260,24 @@ def resolve_jd(url):
     return False, url
 
 
-def _is_external_deal_link(u):
-    """判断 URL 是否为「站外好价外链」：http(s) 开头且不属于源站自身(ixbk)域名。"""
-    if not u or not u.startswith("http"):
-        return False
-    host = (urlparse(u).hostname or "").lower()
-    if not host:
-        return False
-    if host == "ixbk.net" or host.endswith(".ixbk.net"):
-        return False
-    return True
-
-
-def find_deal_link(html):
-    """从正文提取首个站外好价外链（京东/淘宝/天猫/拼多多/或其他电商店铺）。
-    用于判定该条是否属于「好价线报」(类目1)——只要带任意站外商品/店铺链接即收，
-    不再限定京东（修复：源站淘宝/天猫好价密集时整窗被误判为'无链接'而丢弃）。
-    返回 (原始链接, 原始链接) 或 (None, None)。仅排除源站自身站内链接。"""
+def find_jd_link(html):
+    """从正文提取首个京东链接（u.jd.com / jd.com / 3.cn / item.jd.com 等京东域）。
+    仅京东，不要淘宝/拼多多/其他电商或垃圾短链。
+    u.jd.com 本身就是 jd.com 子域，host 判断即可，无需额外网络跳转。
+    返回 (jd_url, jd_url) 或 (None, None)。"""
     if not html:
         return None, None
     for u in extract_links(html):
-        if _is_external_deal_link(u):
+        host = (urlparse(u).hostname or "").lower()
+        if is_jd_host(host):
             return u, u
     return None, None
 
 
 def fetch_detail_link(item):
-    """兜底：正文无站外链接时，抓取源站详情页(IXBK_BASE + item.url)提取首个站外链接。
-    应对部分条目正文未嵌入商品链接的情况（如纯文字播报）。
-    失败或无链接一律返回 None（宁可丢弃，绝不误发）。"""
+    """兜底：正文无京东链接时，抓取源站详情页(IXBK_BASE + item.url)提取首个京东链接。
+    仅京东，绝不把淘宝/拼多多/垃圾短链当作好价链。
+    失败或无京东链接一律返回 None（宁可丢弃，绝不误发）。"""
     url = item.get("url", "") or ""
     if not url:
         return None
@@ -297,7 +286,8 @@ def fetch_detail_link(item):
         r = requests.get(full, timeout=FETCH_TIMEOUT, headers=UA)
         r.raise_for_status()
         for u in extract_links(r.text):
-            if _is_external_deal_link(u):
+            host = (urlparse(u).hostname or "").lower()
+            if is_jd_host(host):
                 return u
     except Exception as e:
         print(f"[WARN] fetch detail page failed ({url}): {e}")
@@ -335,33 +325,33 @@ def is_utility(text):
 
 def classify(item):
     """返回 (category_id, jd_link) 或 (None, None) 表示丢弃。
-    分类优先级：
-      任意站外好价链接(京东/淘宝/天猫/拼多多等) -> 类目1（好价线报，优先）
-        （正文无链接时自动探源站详情页补链）
-      银行/运营商/支付平台/生活缴费 -> 类目10（优惠活动：银行活动 + 通信运营商活动
-                                        + 移动支付平台活动 + 生活缴费优惠）
-      其余                  -> 丢弃
+    分类优先级（用户要求：类目1 只要京东；类目10 收银行/运营商/支付/缴费活动）：
+      1) 正文含京东链接(u.jd.com/jd.com/3.cn 等) -> 类目1（好价线报，仅京东）
+         （正文无京东链接时，自动探源站详情页补一个京东链接）
+      2) 无京东链接时，银行/运营商/支付平台/生活缴费关键词命中 -> 类目10（优惠活动）
+      3) 其余（淘宝/拼多多/无链接非活动/垃圾短链）-> 丢弃
     """
     html = item.get("content_html", "") or ""
-    text_content = item.get("content", "") or ""
-    # 好价链接：content_html 与 content 纯文本两处都可提取（兼容无 HTML 的情况）
-    deal_orig, _ = find_deal_link(html + " " + text_content)
-    if not deal_orig:
-        # 兜底：正文没链接，探源站详情页补一个站外链接
-        deal_orig = fetch_detail_link(item)
-    if deal_orig:
-        return 1, deal_orig                     # 类目1：好价线报（任意平台）
+    # 1) 京东链接优先（仅京东，不要淘宝/拼多多等其他平台）
+    jd_orig, _ = find_jd_link(html)
+    if not jd_orig:
+        # 兜底：正文没京东链接，探源站详情页补一个京东链接
+        jd_orig = fetch_detail_link(item)
+    if jd_orig:
+        return 1, jd_orig                     # 类目1：好价线报（仅京东）
+    # 2) 无京东链接 -> 走银行/运营商/支付平台/生活缴费关键词
     text = " ".join([
         item.get("title", ""),
-        text_content,
+        item.get("content", "") or "",
         item.get("catename", ""),
     ])
     if is_bank(text) or is_telecom(text) or is_payment(text) or is_utility(text):
-        return 10, None                         # 类目10：优惠活动（银行+运营商+支付平台+生活缴费）
+        return 10, None                        # 类目10：优惠活动（银行+运营商+支付平台+生活缴费）
     return None, None
 
 
 # ---------------- WP 侧兜底去重（抗状态文件丢失/漂移/混合触发双发） ----------------
+
 def wp_post_exists(iid, title, cat_id):
     """WP 侧兜底去重，作为 posted.json 的二次保险：
       1) 优先按自定义 meta(xianbao_item_id) 精确查重 —— 跨服务器/GitHub 双触发也不会重复；
