@@ -1,61 +1,95 @@
 #!/bin/bash
-# xianbao 一键命令（宝塔计划任务专用，每 5 分钟执行一次）
-# 用法：宝塔「计划任务」→ 添加任务 → 任务类型「Shell 脚本」→
-#       执行周期选「N 分钟」填 5 → 把下面整段粘到「脚本内容」→ 保存 → 点「执行一次」看输出
-# 只需改 3 个变量（WP_SITE / WP_USER / WP_APP_PASSWORD），其余不用动。
-set -u
+# ============================================================
+# xianbao 自动采集发布（宝塔计划任务专用，每 5 分钟跑一次）
+# 设计目标：在宝塔 cron 下也能稳跑——
+#   1) 不用 heredoc 写 .env（宝塔输入框会破坏多行内容，是“配了没动静”的主因）
+#       -> 直接在 shell 里 export 凭据，main.py 会自动读取环境变量
+#   2) 任意步骤失败都记录到日志，不会静默死掉
+#   3) 末尾打印“线上结果”到屏幕，宝塔「执行一次」就能看到是否真的发了
+#   4) git 同步失败不阻塞发布（用本地代码继续跑）
+# ============================================================
+
 DIR="/www/wwwroot/xianbao"
 REPO="https://github.com/17678319606/xianbao.git"
 LOG="$DIR/xianbao.log"
 
-# ====== 在这里填你的 3 个凭据（必改）======
+# ===== 凭据（改成你自己的也行，默认已是正确值）=====
 WP_SITE="https://12313.icu"
 WP_USER="tougao"
-WP_APP_PASSWORD="l28f DeJP Vwfe zxNH iJhY npci"   # WordPress 应用密码（注意：含空格，原样填写）
-# ===========================================
+WP_APP_PASSWORD="l28f DeJP Vwfe zxNH iJhY npci"
+# ===================================================
 
-echo "$(date '+%F %T') [RUN] start"
+# 同时打到屏幕(宝塔「执行一次」可见)和日志文件
+log(){ echo "[$(date '+%F %T')] $*"; echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 
-# 首次 clone
+mkdir -p "$DIR" 2>/dev/null
+
+# —— 环境诊断（出问题一眼看出缺什么）——
+log "[ENV] git=$(command -v git || echo MISSING) python3=$(command -v python3 || echo MISSING) curl=$(command -v curl || echo MISSING)"
+log "[ENV] pwd_set=$( [ -n "$WP_APP_PASSWORD" ] && echo YES || echo NO )"
+
+# 1) 首次 clone（非阻塞：clone 失败但本地已有代码则继续）
 if [ ! -d "$DIR/.git" ]; then
-  echo "$(date '+%F %T') [SETUP] cloning repo..."
+  log "[SETUP] cloning repo..."
   rm -rf "$DIR"
-  git clone "$REPO" "$DIR" || { echo "$(date '+%F %T') [FATAL] git clone failed"; exit 1; }
-fi
-
-cd "$DIR" || { echo "$(date '+%F %T') [FATAL] cannot cd $DIR"; exit 1; }
-
-# 强制同步最新代码：用 fetch + reset --hard 代替 git pull，
-# 不受本地未跟踪文件（如 posted.json 状态文件）干扰，避免 pull 冲突卡死导致永远停在旧版本。
-git fetch -q origin
-git reset --hard origin/main || { echo "$(date '+%F %T') [FATAL] git sync failed"; exit 1; }
-
-# 自动建 venv + 装依赖（首次或被删后自动恢复）
-if [ ! -f ".venv/bin/python" ]; then
-  echo "$(date '+%F %T') [SETUP] creating venv..."
-  python3 -m venv .venv || { echo "$(date '+%F %T') [FATAL] venv create failed"; exit 1; }
-  .venv/bin/pip install -q requests beautifulsoup4 || { echo "$(date '+%F %T') [FATAL] pip install failed"; exit 1; }
-fi
-
-# 生成 .env（含凭据 + 企微告警地址）
-cat > .env << ENVEOF
-WP_SITE=${WP_SITE}
-WP_USER=${WP_USER}
-WP_APP_PASSWORD=${WP_APP_PASSWORD}
-PUBLISH_STATUS=publish
-WXWORK_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=ca5e918f-8e98-4c96-9734-8e5d27b298d0
-ALERT_EMAIL=weixinkaifa@jinbufenzi.work
-ENVEOF
-chmod 600 .env
-
-# 日志轮转：超过 5MB 则清空（避免占满 1H1G 磁盘）
-if [ -f "$LOG" ]; then
-  size=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
-  if [ "$size" -gt 5242880 ]; then
-    : > "$LOG"
+  if ! git clone "$REPO" "$DIR" >> "$LOG" 2>&1; then
+    if [ -f "$DIR/main.py" ]; then
+      log "[WARN] git clone failed, but local code exists, continue"
+    else
+      log "[FATAL] git clone failed AND no local code -> exit"
+      exit 1
+    fi
   fi
 fi
 
-# 执行采集发布（输出追加到日志，便于排查；宝塔里点「执行一次」也能看到本次输出）
-.venv/bin/python main.py >> "$LOG" 2>&1
-echo "$(date '+%F %T') [RUN] done exit=$?"
+cd "$DIR" || { log "[FATAL] cannot cd $DIR"; exit 1; }
+
+# 2) 同步代码（非阻塞：失败仅警告，用本地代码继续跑，保证发布不中断）
+if git fetch -q origin 2>> "$LOG" && git reset --hard origin/main 2>> "$LOG"; then
+  log "[SYNC] code updated -> $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+else
+  log "[WARN] git sync failed, using local code (发布不受影响)"
+fi
+
+# 3) 选 python 解释器（优先 venv，否则系统 python3）
+if [ -x ".venv/bin/python" ]; then
+  PY=".venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PY="$(command -v python3)"
+else
+  log "[FATAL] 系统没有 python3，无法运行 -> exit"
+  exit 1
+fi
+log "[ENV] using python: $PY ($($PY --version 2>&1))"
+
+# 4) 确保依赖装好（用选定的解释器，少一层 venv 失败）
+$PY -m pip install -q requests beautifulsoup4 2>> "$LOG" \
+  || log "[WARN] pip install failed, trying to continue"
+
+# 5) 直接 export 凭据给 python（无需 .env 文件，绕开宝塔 heredoc 破坏）
+export WP_SITE WP_USER WP_APP_PASSWORD
+export PUBLISH_STATUS="publish"
+export WXWORK_WEBHOOK="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=ca5e918f-8e98-4c96-9734-8e5d27b298d0"
+export ALERT_EMAIL="weixinkaifa@jinbufenzi.work"
+
+# 6) 运行主程序（详情进日志）
+log "[RUN] start main.py"
+$PY main.py >> "$LOG" 2>&1
+rc=$?
+log "[RUN] done exit=$rc"
+
+# 7) 汇总：查线上 WP 类目1 最新时间 + 总数，打印到屏幕（重点可观测性）
+total=$(curl -s -m 15 -D - -o /dev/null "https://12313.icu/wp-json/wp/v2/posts?categories=1&per_page=1" 2>/dev/null | grep -i "x-wp-total" | tr -d '\r' | awk '{print $2}')
+latest=$(curl -s -m 15 "https://12313.icu/wp-json/wp/v2/posts?categories=1&per_page=1&orderby=date&order=desc&_fields=date" 2>/dev/null | grep -o '"date":"[^"]*"' | head -1 | sed 's/"date":"//;s/"//')
+echo "================ xianbao 本轮结果 ================"
+echo "退出码        : $rc"
+echo "线上类目1总数 : ${total:-查询失败}"
+echo "线上类目1最新 : ${latest:-查询失败}"
+echo "本地日志      : $LOG （tail -20 看详情）"
+echo "=================================================="
+
+# 8) 日志轮转（>5MB 清空，避免占满 1H1G 磁盘）
+if [ -f "$LOG" ]; then
+  sz=$(stat -c%s "$LOG" 2>/dev/null || echo 0)
+  [ "$sz" -gt 5242880 ] && : > "$LOG"
+fi
