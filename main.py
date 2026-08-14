@@ -157,6 +157,18 @@ PAYMENT_KEYWORDS = [
     "消费券", "支付优惠", "扫码立减", "扫码红包",
 ]
 
+# 生活缴费优惠关键词（命中即归「优惠活动」类目 id=10）。
+# 覆盖：水费 / 电费 / 燃气费 / 暖气费 / 物业费 / 宽带费等缴费场景的
+# 「缴费优惠、缴费立减、缴费满减、缴费红包、充值缴费」等活动。
+# 设计：以"生活缴费"作为强信号，辅以具体缴费品类词 + 缴费信号词组，
+# 既避免漏抓，也尽量降低裸词过宽误判（如"费"字不会单独命中）。
+UTILITY_KEYWORDS = [
+    "生活缴费", "水电缴费", "缴费优惠", "缴费立减", "缴费满减", "缴费红包",
+    "充值缴费", "代缴", "代缴费", "缴费活动",
+    "水费", "电费", "燃气费", "煤气费", "暖气费", "供暖费", "暖费",
+    "物业费", "水电燃气", "水电煤", "燃气",
+]
+
 
 # ---------------- 状态（去重 + 30天清理） ----------------
 def load_state():
@@ -303,11 +315,16 @@ def is_payment(text):
     return any(kw in text for kw in PAYMENT_KEYWORDS)
 
 
+def is_utility(text):
+    return any(kw in text for kw in UTILITY_KEYWORDS)
+
+
 def classify(item):
     """返回 (category_id, jd_link) 或 (None, None) 表示丢弃。
     分类优先级：
       真实京东链接         -> 类目1（京东好价线报，优先）
-      银行/运营商/支付平台  -> 类目10（优惠活动：银行活动 + 通信运营商活动 + 移动支付平台活动）
+      银行/运营商/支付平台/生活缴费 -> 类目10（优惠活动：银行活动 + 通信运营商活动
+                                        + 移动支付平台活动 + 生活缴费优惠）
       其余                  -> 丢弃
     """
     html = item.get("content_html", "") or ""
@@ -321,8 +338,8 @@ def classify(item):
         text_content,
         item.get("catename", ""),
     ])
-    if is_bank(text) or is_telecom(text) or is_payment(text):
-        return 10, None                         # 类目10：优惠活动（银行+运营商+支付平台）
+    if is_bank(text) or is_telecom(text) or is_payment(text) or is_utility(text):
+        return 10, None                         # 类目10：优惠活动（银行+运营商+支付平台+生活缴费）
     return None, None
 
 
