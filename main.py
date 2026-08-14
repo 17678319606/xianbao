@@ -40,8 +40,14 @@ from bs4 import BeautifulSoup
 def load_dotenv(path=".env"):
     """极简 .env 解析（不引入 python-dotenv 依赖）。仅填充尚未存在的变量。
     必须在读取 WP_SITE/WP_USER/WP_APP_PASSWORD 之前执行（见下方调用）。"""
+    # 若传入相对路径，基于脚本所在目录解析为绝对路径（防 cron/cwd 漂移）
+    if not os.path.isabs(path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, path)
     if not os.path.exists(path):
+        print(f"[WARN] .env not found at {path}")
         return
+    count = 0
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -52,6 +58,8 @@ def load_dotenv(path=".env"):
                 k, v = k.strip(), v.strip().strip('"').strip("'")
                 if k and k not in os.environ:
                     os.environ[k] = v
+                    count += 1
+        print(f"[INFO] loaded {count} vars from {path}")
     except Exception as e:
         print(f"[WARN] load .env failed: {e}")
 
@@ -69,6 +77,10 @@ PUSH_URL = IXBK_BASE + "/plus/json/push.json"
 WP_SITE = os.environ.get("WP_SITE", "").strip().rstrip("/")
 WP_USER = os.environ.get("WP_USER", "")
 WP_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
+
+# 调试：确认凭据是否加载（仅打印脱敏信息，不泄露密码）
+_pwd_mask = "SET" if WP_APP_PASSWORD else "MISSING"
+print(f"[INFO] config: site={WP_SITE} user={WP_USER} app_password={_pwd_mask}")
 
 STATE_FILE = "posted.json"
 HEARTBEAT_FILE = "last_run.json"
